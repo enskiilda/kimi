@@ -28,18 +28,11 @@
 // ROZUMIESZ KURWA?! Powtarzam: ROZUMIESZ?! Twoje milczenie lub potwierdzenie traktuję jako bezwarunkowe przyjęcie tych zasad!
 
 
-import { Mistral } from "@mistralai/mistralai";
-import Kernel from "@onkernel/sdk";
+import { Stagehand } from "@browserbasehq/stagehand";
 import { killDesktop, getDesktop } from "@/lib/e2b/utils";
-import { resolution } from "@/lib/e2b/tool";
 
-// Mistral AI Configuration - HARDCODED
-const MISTRAL_API_KEY = "6kC3YYU0fstrvm9WCQudLOKEK53DhvNU";
-const MISTRAL_MODEL = "mistral-medium-2508";
-
-// OnKernel Configuration - HARDCODED
-const ONKERNEL_API_KEY = "sk_85dd38ea-b33f-45b5-bc33-0eed2357683a.t2lQgq3Lb6DamEGhcLiUgPa1jlx+1zD4BwAdchRHYgA";
-const kernelClient = new Kernel({ apiKey: ONKERNEL_API_KEY });
+const GROQ_API_KEY = "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";
+const STAGEHAND_MODEL = "groq/moonshotai/kimi-k2-instruct";
 
 export const runtime = 'nodejs';
 export const maxDuration = 3600;
@@ -195,460 +188,173 @@ WAZNE!!! KAZDE ZADSNIE MUSISZ ZACZYNAC OD NAPISANIA WIADOMOSCI DOPIERO GDY NAPIS
 
 Pamiętaj: Jesteś pomocnym asystentem, który **działa** zamiast tylko mówić. Użytkownicy liczą na to, że wykonasz zadanie, nie tylko je opiszesz. Bądź proaktywny, transparentny i skuteczny!`;
 
-const tools = [
-  {
-    type: "function",
-    function: {
-      name: "computer_use",
-      description: "Use a mouse and keyboard to interact with a computer, and take screenshots.",
-      parameters: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            enum: [
-              "screenshot",
-              "left_click",
-              "double_click",
-              "right_click",
-              "mouse_move",
-              "type",
-              "key",
-              "scroll",
-              "left_click_drag",
-              "wait",
-            ],
-            description: "The action to perform.",
-          },
-          coordinate: {
-            type: "array",
-            items: { type: "integer" },
-            minItems: 2,
-            maxItems: 2,
-            description: "[X, Y] coordinates for mouse actions and scroll. X is horizontal (0-1023), Y is vertical (0-767). For scroll action, these are the coordinates where scrolling occurs (optional, defaults to center).",
-          },
-          start_coordinate: {
-            type: "array",
-            items: { type: "integer" },
-            minItems: 2,
-            maxItems: 2,
-            description: "Starting [X, Y] coordinates for drag action.",
-          },
-          text: {
-            type: "string",
-            description: "Text to type or key to press.",
-          },
-          scroll_direction: {
-            type: "string",
-            enum: ["up", "down"],
-            description: "Direction to scroll.",
-          },
-          scroll_amount: {
-            type: "integer",
-            description: "Number of scroll clicks (default: 3).",
-          },
-          duration: {
-            type: "integer",
-            description: "Duration to wait in seconds (max 2).",
-          },
-        },
-        required: ["action"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "bash_command",
-      description: "Execute a bash command in the Linux terminal.",
-      parameters: {
-        type: "object",
-        properties: {
-          command: {
-            type: "string",
-            description: "The bash command to execute.",
-          },
-        },
-        required: ["command"],
-      },
-    },
-  },
-];
+
+type ChatRole = "system" | "user" | "assistant";
+
+type ChatMessage = {
+  role: ChatRole;
+  content: string;
+};
+
+type ChatRequestBody = {
+  messages: ChatMessage[];
+  sandboxId?: string;
+};
+
+type StagehandAgentAction = {
+  type: string;
+  reasoning?: string;
+  taskCompleted?: boolean;
+  action?: string;
+  timeMs?: number;
+  pageText?: string;
+  pageUrl?: string;
+  instruction?: string;
+  [key: string]: unknown;
+};
+
+type StreamEvent = {
+  type: string;
+  [key: string]: unknown;
+};
+
+const summarizeAction = (action: StagehandAgentAction): string => {
+  const details: string[] = [];
+
+  if (action.action) {
+    details.push(`Akcja: ${action.action}`);
+  }
+
+  if (action.reasoning) {
+    details.push(`Uzasadnienie: ${action.reasoning}`);
+  }
+
+  if (action.pageUrl) {
+    details.push(`URL: ${action.pageUrl}`);
+  }
+
+  if (action.taskCompleted !== undefined) {
+    details.push(action.taskCompleted ? "Status: wykonano" : "Status: w toku");
+  }
+
+  if (details.length === 0) {
+    details.push(`Typ akcji: ${action.type}`);
+  }
+
+  return details.join(" | ");
+};
 
 export async function POST(request: Request) {
-  const { messages, sandboxId } = await request.json();
-
-  const desktop = await getDesktop(sandboxId);
+  const { messages, sandboxId } = (await request.json()) as ChatRequestBody;
 
   const encoder = new TextEncoder();
-  let isStreamClosed = false;
 
-  const stream = new ReadableStream({
+  const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const sendEvent = (event: any) => {
-        if (isStreamClosed) return;
-        try {
-          const jsonLine = JSON.stringify(event) + "\n";
-          controller.enqueue(encoder.encode(jsonLine));
-        } catch (err) {
-          console.error("Error sending event:", err);
-        }
+      let stagehandInstance: Stagehand | null = null;
+      let desktop: Awaited<ReturnType<typeof getDesktop>> | null = null;
+
+      const sendEvent = (event: StreamEvent) => {
+        controller.enqueue(encoder.encode(`${JSON.stringify(event)}
+`));
       };
 
       try {
-        const mistral = new Mistral({ apiKey: MISTRAL_API_KEY });
+        desktop = await getDesktop(sandboxId);
 
-        const chatHistory: any[] = [
-          { role: "system", content: INSTRUCTIONS },
-          ...messages,
-        ];
-
-        const maxIterations = 100;
-        let iteration = 0;
-
-        while (iteration < maxIterations) {
-          iteration++;
-
-          const response = await mistral.chat.stream({
-            model: MISTRAL_MODEL,
-            messages: chatHistory,
-            tools: tools as any,
-            temperature: 0.3,
-            maxTokens: 4096,
-          });
-
-          let fullText = "";
-          let toolCalls: any[] = [];
-
-          for await (const event of response) {
-            if (event.data.choices && event.data.choices.length > 0) {
-              const choice = event.data.choices[0];
-              const delta = choice.delta;
-
-              if (delta.content) {
-                fullText += delta.content;
-                sendEvent({
-                  type: "text-delta",
-                  textDelta: delta.content,
-                });
-              }
-
-              if (delta.toolCalls) {
-                for (const toolCallDelta of delta.toolCalls) {
-                  const index = toolCallDelta.index;
-
-                  if (index !== undefined && !toolCalls[index]) {
-                    toolCalls[index] = {
-                      id: toolCallDelta.id || `call_${Date.now()}_${index}`,
-                      name: toolCallDelta.function?.name || "",
-                      arguments: "",
-                    };
-                  }
-
-                  if (index !== undefined && toolCallDelta.function?.arguments) {
-                    toolCalls[index].arguments += toolCallDelta.function.arguments;
-                  }
-                }
-              }
-            }
-          }
-
-          if (toolCalls.length > 0) {
-            const firstToolCall = toolCalls[0];
-            const assistantMessage: any = {
-              role: "assistant",
-              content: fullText || null,
-              toolCalls: [{
-                id: firstToolCall.id,
-                type: "function",
-                function: {
-                  name: firstToolCall.name,
-                  arguments: firstToolCall.arguments,
-                },
-              }],
-            };
-            chatHistory.push(assistantMessage);
-
-            const toolCall = firstToolCall;
-            const parsedArgs = JSON.parse(toolCall.arguments);
-            const toolName = toolCall.name === "computer_use" ? "computer" : "bash";
-
-            sendEvent({
-              type: "tool-input-available",
-              toolCallId: toolCall.id,
-              toolName: toolName,
-              input: parsedArgs,
-            });
-
-            const toolResult = await (async () => {
-              try {
-                let resultData: any = { type: "text", text: "" };
-                let resultText = "";
-
-                if (toolCall.name === "computer_use") {
-                  const action = parsedArgs.action;
-
-                  switch (action) {
-                    case "screenshot": {
-                      const response = await kernelClient.browsers.computer.captureScreenshot(desktop.session_id);
-                      const blob = await response.blob();
-                      const buffer = Buffer.from(await blob.arrayBuffer());
-                      
-                      const timestamp = new Date().toISOString();
-                      const width = resolution.x;
-                      const height = resolution.y;
-
-                      const vBounds = { top: 255, middle: 511 };
-                      const hBounds = { left: 341, center: 682 };
-
-                      resultText = `Screenshot taken at ${timestamp}
-
-SCREEN: ${width}×${height} pixels | Aspect ratio: 4:3 | Origin: (0,0) at TOP-LEFT
-⚠️  REMEMBER: Y=0 is at TOP, Y increases DOWNWARD (0→767)
-⚠️  FORMAT: [X, Y] - horizontal first, then vertical`;
-
-                      resultData = {
-                        type: "image",
-                        data: buffer.toString("base64"),
-                      };
-
-                      sendEvent({
-                        type: "screenshot-update",
-                        screenshot: buffer.toString("base64"),
-                      });
-                      break;
-                    }
-                    case "wait": {
-                      const duration = parsedArgs.duration || 1;
-                      resultText = `Waited for ${duration} seconds`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "left_click": {
-                      const [x, y] = parsedArgs.coordinate;
-                      await kernelClient.browsers.computer.clickMouse(desktop.session_id, {
-                        x,
-                        y,
-                        button: 'left',
-                      });
-                      resultText = `Left clicked at coordinates (${x}, ${y})`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "double_click": {
-                      const [x, y] = parsedArgs.coordinate;
-                      await kernelClient.browsers.computer.clickMouse(desktop.session_id, {
-                        x,
-                        y,
-                        button: 'left',
-                        num_clicks: 2,
-                      });
-                      resultText = `Double clicked at coordinates (${x}, ${y})`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "right_click": {
-                      const [x, y] = parsedArgs.coordinate;
-                      await kernelClient.browsers.computer.clickMouse(desktop.session_id, {
-                        x,
-                        y,
-                        button: 'right',
-                      });
-                      resultText = `Right clicked at coordinates (${x}, ${y})`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "mouse_move": {
-                      const [x, y] = parsedArgs.coordinate;
-                      await kernelClient.browsers.computer.moveMouse(desktop.session_id, {
-                        x,
-                        y,
-                      });
-                      resultText = `Moved mouse to ${x}, ${y}`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "type": {
-                      const textToType = parsedArgs.text;
-                      await kernelClient.browsers.computer.typeText(desktop.session_id, {
-                        text: textToType,
-                      });
-                      resultText = `Typed: ${textToType}`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "key": {
-                      let keyToPress = parsedArgs.text;
-                      
-                      // OnKernel uses X11 keysym names - convert common variants to X11 format
-                      if (keyToPress === "Enter" || keyToPress === "enter") {
-                        keyToPress = "Return";
-                      }
-                      
-                      console.log(`[KEY ACTION] Original: "${parsedArgs.text}", Normalized: "${keyToPress}", Sending to API: { keys: ["${keyToPress}"] }`);
-                      
-                      await kernelClient.browsers.computer.pressKey(desktop.session_id, {
-                        keys: [keyToPress],
-                      });
-                      resultText = `Pressed key: ${parsedArgs.text}`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "scroll": {
-                      const direction = parsedArgs.scroll_direction as "up" | "down";
-                      const amount = parsedArgs.scroll_amount || 3;
-                      const deltaY = direction === "down" ? amount * 120 : -amount * 120;
-                      
-                      // Use provided coordinates or default to center of screen
-                      const [scrollX, scrollY] = parsedArgs.coordinate || [512, 384];
-                      
-                      await kernelClient.browsers.computer.scroll(desktop.session_id, {
-                        x: scrollX,
-                        y: scrollY,
-                        delta_x: 0,
-                        delta_y: deltaY,
-                      });
-                      resultText = `Scrolled ${direction} by ${amount} clicks at coordinates (${scrollX}, ${scrollY})`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    case "left_click_drag": {
-                      const [startX, startY] = parsedArgs.start_coordinate;
-                      const [endX, endY] = parsedArgs.coordinate;
-                      await kernelClient.browsers.computer.dragMouse(desktop.session_id, {
-                        path: [[startX, startY], [endX, endY]],
-                        button: 'left',
-                      });
-                      resultText = `Dragged from (${startX}, ${startY}) to (${endX}, ${endY})`;
-                      resultData = { type: "text", text: resultText };
-                      break;
-                    }
-                    default: {
-                      resultText = `Unknown action: ${action}`;
-                      resultData = { type: "text", text: resultText };
-                      console.warn("Unknown action:", action);
-                    }
-                  }
-
-                  sendEvent({
-                    type: "tool-output-available",
-                    toolCallId: toolCall.id,
-                    output: resultData,
-                  });
-
-                  return {
-                    tool_call_id: toolCall.id,
-                    role: "tool",
-                    content: resultText,
-                    image: action === "screenshot" ? resultData.data : undefined,
-                  };
-                } else if (toolCall.name === "bash_command") {
-                  const result = await kernelClient.browsers.process.exec(desktop.session_id, {
-                    command: parsedArgs.command,
-                  });
-
-                  const stdout = result.stdout_b64 ? Buffer.from(result.stdout_b64, 'base64').toString('utf-8') : '';
-                  const stderr = result.stderr_b64 ? Buffer.from(result.stderr_b64, 'base64').toString('utf-8') : '';
-                  const output = stdout || stderr || "(Command executed successfully with no output)";
-
-                  sendEvent({
-                    type: "tool-output-available",
-                    toolCallId: toolCall.id,
-                    output: { type: "text", text: output },
-                  });
-
-                  return {
-                    tool_call_id: toolCall.id,
-                    role: "tool",
-                    content: output,
-                  };
-                }
-              } catch (error) {
-                console.error("Error executing tool:", error);
-                const errorMsg = error instanceof Error ? error.message : String(error);
-                let detailedError = `Error: ${errorMsg}`;
-
-                if (errorMsg.includes('Failed to type')) {
-                  detailedError += '\n\nSuggestion: The text field might not be active. Try clicking on the text field first before typing.';
-                } else if (errorMsg.includes('Failed to click') || errorMsg.includes('Failed to double click') || errorMsg.includes('Failed to right click')) {
-                  detailedError += '\n\nSuggestion: The click action failed. Take a screenshot to see what happened, then try clicking again.';
-                } else if (errorMsg.includes('Failed to take screenshot')) {
-                  detailedError += '\n\nSuggestion: Screenshot failed. The desktop might be loading. Wait a moment and try again.';
-                } else if (errorMsg.includes('Failed to press key')) {
-                  detailedError += '\n\nSuggestion: Key press failed. Make sure the correct window is focused.';
-                } else if (errorMsg.includes('Failed to move mouse')) {
-                  detailedError += '\n\nSuggestion: Mouse movement failed. Try again.';
-                } else if (errorMsg.includes('Failed to drag')) {
-                  detailedError += '\n\nSuggestion: Drag operation failed. Try again with different coordinates.';
-                } else if (errorMsg.includes('Failed to scroll')) {
-                  detailedError += '\n\nSuggestion: Scroll failed. Make sure a scrollable window is active.';
-                } else if (errorMsg.includes('Failed to execute bash')) {
-                  detailedError += '\n\nSuggestion: Bash command failed. Check the command syntax and try again.';
-                }
-
-                sendEvent({
-                  type: "error",
-                  errorText: errorMsg,
-                });
-
-                return {
-                  tool_call_id: toolCall.id,
-                  role: "tool",
-                  content: detailedError,
-                };
-              }
-            })();
-
-            if (toolResult!.image) {
-              chatHistory.push({
-                role: "tool",
-                toolCallId: toolResult!.tool_call_id,
-                content: [
-                  {
-                    type: "text",
-                    text: toolResult!.content,
-                  },
-                  {
-                    type: "image_url",
-                    imageUrl: `data:image/png;base64,${toolResult!.image}`,
-                  },
-                ],
-              });
-            } else {
-              chatHistory.push({
-                role: "tool",
-                toolCallId: toolResult!.tool_call_id,
-                content: toolResult!.content,
-              });
-            }
-          } else {
-            if (fullText) {
-              chatHistory.push({
-                role: "assistant",
-                content: fullText,
-              });
-            }
-
-            sendEvent({
-              type: "finish",
-              content: fullText,
-            });
-
-            break;
-          }
-        }
-      } catch (error) {
-        console.error("Chat API error:", error);
-        await killDesktop(sandboxId);
-        sendEvent({
-          type: "error",
-          errorText: String(error),
+        stagehandInstance = new Stagehand({
+          env: "LOCAL",
+          localBrowserLaunchOptions: {
+            cdpUrl: desktop.cdp_ws_url,
+          },
+          model: {
+            modelName: STAGEHAND_MODEL,
+            apiKey: GROQ_API_KEY,
+          },
+          systemPrompt: INSTRUCTIONS,
+          verbose: 1,
+          domSettleTimeout: 30_000,
         });
-      } finally {
-        if (!isStreamClosed) {
-          isStreamClosed = true;
-          controller.close();
+
+        await stagehandInstance.init();
+
+        const pages = stagehandInstance.context.pages();
+        const page = pages[0];
+
+        if (!page) {
+          throw new Error("Stagehand nie udostępnił strony kontekstowej.");
         }
+
+        const agent = stagehandInstance.agent({
+          systemPrompt: INSTRUCTIONS,
+        });
+
+        const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
+
+        if (!latestUserMessage) {
+          sendEvent({
+            type: "text-delta",
+            textDelta: "Nie znaleziono wiadomości użytkownika do przetworzenia.",
+          });
+          sendEvent({ type: "finish" });
+          return;
+        }
+
+        const agentResult = await agent.execute({
+          instruction: latestUserMessage.content,
+          page,
+        });
+
+        const actions = Array.isArray(agentResult.actions) ? agentResult.actions : [];
+
+        actions.forEach((action, index) => {
+          sendEvent({
+            type: "tool-output-available",
+            toolCallId: `stagehand-action-${index}`,
+            output: {
+              type: "text",
+              text: summarizeAction(action as StagehandAgentAction),
+            },
+          });
+        });
+
+        const statusText = agentResult.success
+          ? "Automatyzacja zakończona powodzeniem."
+          : "Automatyzacja zakończyła się niepowodzeniem.";
+
+        sendEvent({
+          type: "tool-output-available",
+          toolCallId: "stagehand-summary",
+          output: { type: "text", text: statusText },
+        });
+
+        const responseMessage = agentResult.message?.trim().length
+          ? agentResult.message
+          : "Agent nie zwrócił odpowiedzi tekstowej.";
+
+        sendEvent({
+          type: "text-delta",
+          textDelta: responseMessage,
+        });
+
+        sendEvent({ type: "finish" });
+      } catch (error) {
+        const errorText = error instanceof Error ? error.message : String(error);
+        sendEvent({ type: "error", errorText });
+
+        if (desktop?.session_id) {
+          await killDesktop(desktop.session_id);
+        }
+      } finally {
+        if (stagehandInstance) {
+          try {
+            await stagehandInstance.close();
+          } catch (closeError) {
+            console.error("Błąd zamykania Stagehand:", closeError);
+          }
+        }
+
+        controller.close();
       }
     },
   });
